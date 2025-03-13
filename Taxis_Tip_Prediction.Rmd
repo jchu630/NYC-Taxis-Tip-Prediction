@@ -1,0 +1,905 @@
+---
+title: "NYC Taxis Tip Prediction"
+author: "Jadon Chu"
+date: "27 Aug 2024"
+output: 
+  html_document:
+    toc: yes
+    toc_depth: 3
+    number_sections: no
+    toc_float:
+      collapsed: yes
+      smooth_scroll: yes
+---
+```{r setup, include=TRUE, warning=FALSE }
+knitr::opts_chunk$set(echo=TRUE, message=FALSE, warning=FALSE, error=FALSE)
+
+# Load libraries
+library(tidyverse)
+library(lubridate)
+library(leaflet)
+library(leaps)
+```
+
+# Overview
+
+In the USA, many service workers rely heavily on "tips" for their income. Tips are nominally voluntary payments by the customer in additional to the listed price. For yellow taxis in New York, tourist advice suggests a tip of 15-20%. 
+
+In this project, we will be using a rich data set from New York taxis to make a predictive model for tips.
+
+**Data:** 
+
+The [Taxi Data](https://www.nyc.gov/site/tlc/about/tlc-trip-record-data.page) is from [The Official Website of the City of New York](https://www.nyc.gov/) and consists of two weeks of taxi trips in New York City, including information on time of day, day of the week, trip distance, price, number of passengers, locations of pickup and dropoff. 
+
+**Main task:** 
+
+We will use the data from week 2 of February 2017 and construct a model that predicts the amount of a tip.  We will then evaluate the mean squared error of this model on the data from week 4 of February 2017.
+
+
+# 1. Data Exploration & Cleaning
+
+### Importing the Data
+
+A first glimpse at the data:
+
+```{r}
+taxis <- read_csv("week2.csv")
+glimpse(taxis) # have a glimpse of the data
+```
+
+Looking at the summaries of each variable: 
+
+```{r}
+taxis |> summary() 
+```
+
+**Unusual data observations: **
+
+- Maximum passenger count is 9 (Usually taxis seat 4 at max)
+
+- `RateCodeID` max is 99 (there should only be values between 1-6 according to the provided data dictionary)
+
+- Lowest `fare_amount` is -175 (negative value) 
+
+- Negative value of -10.56 `tip_amount` 
+
+- Negative value of -10 `tolls_amount`
+
+- Negative `total_amount` of -175.3
+
+- The minimum number of passengers in a taxi ride is 0`
+
+Some of these variables are not important to this analysis and model-building. 
+
+Other notes: 
+
+- Remove `congestion_surcharge` & `airport_fee` (NAs => useless) 
+
+Taking a closer look at `tpep_pickup_datetime`.
+
+```{r}
+head(taxis$tpep_pickup_datetime)
+```
+
+Times given are in date-time format as we want but apparently UTC (Universal Coordinated Time), shift for New York (EST)?
+
+
+### Visualizing the Data
+
+A first look at the `hourly_pattern` of taxi pickup times: 
+
+```{r}
+taxis |>
+  ggplot(aes(x=factor(hour(tpep_pickup_datetime)))) + 
+  geom_bar() + 
+  labs(title = "Hourly pattern of taxi pickup times", 
+       x = "Hour", y = "Count")
+```
+
+This appears to be a fairly reasonable day/night pattern so we are likely already in EST, not UTC. Perhaps the time of day will affect tip amount. 
+
+Count of each `payment_type`:
+
+```{r}
+taxis |> count(payment_type)
+```
+
+There are only 4 of the possible 7 payment types. Note that cash tips are not included in `tip_amount` and `total_amount`. Therefore, when predicting tips, we assume that they are given by credit card.  
+
+Renaming some variables and deriving some columns that may be useful: 
+
+```{r}
+taxis <- taxis |>
+  mutate(dropoff_datetime = tpep_dropoff_datetime,
+         pickup_datetime = tpep_pickup_datetime,
+         dow = wday(pickup_datetime,label=TRUE,abbr=TRUE, week_start = 1),                           
+         hour_trip_start = factor(hour(pickup_datetime)),                                   
+         trip_duration = as.numeric(difftime(dropoff_datetime,pickup_datetime,units="mins")),    
+         payment_type_label = fct_recode(factor(payment_type), 
+                                         "Credit Card"="1",
+                                         "Cash"="2",
+                                         "No Charge"="3",
+                                         "Other"="4"))
+```
+
+Removing duplicate columns and columns `congestion_surcharge` and `airport_fee` because they are useless.
+
+```{r}
+taxis <- taxis |>  
+  select(-congestion_surcharge, -airport_fee, -tpep_dropoff_datetime, -tpep_pickup_datetime)
+glimpse(taxis) 
+```
+
+The taxis data frame looks much cleaner.  
+
+### Addressing Unusual Data
+
+A first look at the distribution of tips:
+
+```{r}
+
+ggplot(taxis, aes(x = tip_amount)) + 
+  geom_histogram(binwidth = 1, fill = "cyan", color = "black") + 
+  theme_minimal() + 
+  labs(title = "Distribution of Tips", x = "Tip Amount ($)", y = "Frequency")
+```
+
+Clearly, not a great visualization. This is likely because of the extreme value(s) and negative values noted before. Let's see if they are outliers. 
+
+Taxi rides with the most tip amounts:
+
+```{r}
+
+taxis |> 
+  arrange(desc(tip_amount)) |>
+  select(tip_amount, fare_amount, total_amount, trip_duration, trip_distance, passenger_count, payment_type, RatecodeID) |>
+  head(20)
+```
+Looking at the rides with the most tip amounts, with the mean being 1.8 (from the summary) it is clear that all these tip amounts that are over the value of 100 are outliers, perhaps even below 50. 
+
+Included are the columns of variables that may be useful to provide context of these extremely high value tips. A few observations here:  
+
+- The `payment_type` is consistently the value of 1, so these extremely high value tips are all paid by credit card.
+
+- `fare_amount` is highly varied i.e. there are high fares and low fares with these very high tip amounts. 
+
+- `trip_duration` and trip distance is also highly varied. 
+
+- Here, `RatecodeID` is mostly the value of 1 or 5 (standard rate or negotiated fare), but there are no values of 3 or 4. 
+
+There is no clear factor that causes these extremely high tips other than they are given by very wealthy riders, and, considering the low mean of $1.79 and relatively large dataset, it makes sense to remove these outliers and generalize closer to the people of New York City.  
+
+Taxi rides with the smallest tip amounts (looking at negative values):
+
+```{r}
+taxis |> 
+  arrange(tip_amount) |>
+  select(tip_amount, fare_amount, total_amount, trip_duration, trip_distance, passenger_count, payment_type, RatecodeID) |>
+  head(20)
+
+taxis |> count(tip_amount < 0) # 23 negative tips
+taxis |> count(fare_amount < 0) # 999 negative fare amounts
+taxis |> count(total_amount  < 0) # 999 negative total amounts
+```
+
+There are a few tip amounts that have negative values. These values do not make sense and are likely data entry errors.
+We observe that `trip_distance` is mostly 0, `payment_type` is mostly the value of 3 (No charge), and `trip_duration` are very small values (seconds) indicating that the `fare_amount`/`total_amount` values could be refunds and hence the negative values. 
+Thus, it makes sense to remove these rows since they are not real 'tips'. 
+
+Remove negative values (refunds or data entry errors) and cap tips to the value of 100:
+
+```{r}
+# Clean up taxis data frame
+taxis_clean <- taxis |>
+  filter(tip_amount >= 0 & total_amount >= 0 & fare_amount >= 0 & tip_amount <= 100)
+nrow(taxis_clean) 
+```
+Over 1000 rows removed (now 2200150 rows)
+
+Looking at the distribution of tips again:
+
+```{r}
+ggplot(taxis_clean, aes(x = tip_amount)) + 
+  geom_histogram(binwidth = 1, fill = "cyan", color = "black") + 
+  theme_minimal() + 
+  labs(title = "Distribution of Tips (After Removing Outliers)", x = "Tip Amount ($)", y = "Frequency")
+
+# New top valued tips
+taxis_clean |> 
+  arrange(desc(tip_amount)) |>
+  select(tip_amount, fare_amount, total_amount, trip_duration, trip_distance, passenger_count, payment_type, RatecodeID) |>
+  head(20)
+```
+The histogram shows a significant number of tips clustered around lower values (which makes sense due to the mean), with very few instances beyond $25 (outliers).
+It is important to consider how the presence of outliers may impact the performance of the predictive model for tips. 
+Outliers can disproportionately influence the model which can lead to predictions that may not generalize well to the majority of cases. 
+Especially since we have over 2 million values with most tips well below \$25 and only very few values that are over \$25, setting a lower threshold allows us to focus on more common tipping behaviour which will likely make the model more accurate for the majority of predictions. 
+
+
+Set the threshold to $25:
+```{r}
+taxis_clean <- taxis_clean |> 
+  filter(tip_amount <= 25)
+nrow(taxis_clean) 
+
+```
+
+2199359 rows so only less than 1000 more rows were removed.
+
+
+Re-plot the distribution:
+
+```{r}
+ggplot(taxis_clean, aes(x = tip_amount)) + 
+  geom_histogram(binwidth = 1, fill = "cyan", color = "black") + 
+  theme_minimal() + 
+  labs(title = "Distribution of Tips (After Setting Threshold to $25)", x = "Tip Amount ($)", y = "Frequency")
+```
+
+Much better. Note that the distribution of tips is right-skewed, so when building the model it may likely over-estimate the actual tip amount. 
+
+Check the new summary:
+```{r}
+taxis_clean |> summary()
+```
+
+There is still some unusual data that needs to be addressed as they might affect tip amounts:
+
+- The minimum `passenger_count` is 0
+
+- The `RatecodeID` has a value of 99
+
+- The minimum `trip_duration` is -24455.38 and the maximum is 1440 minutes (24 hours)
+
+- The minimum value of `Extra` is -4.61 (but not important)
+
+- The maximum value of `total_amount`/`fare_amount` is unusually high (may correspond to the max value of `trip_distance`)
+
+Let's look at the `passenger_count` first:
+
+```{r}
+taxis_clean |> 
+  arrange(passenger_count) |>
+  select(passenger_count, tip_amount, fare_amount, total_amount, trip_duration, trip_distance, payment_type, RatecodeID) |>
+  head(20)
+```
+
+It does not make sense that a taxi ride can have 0 passengers in it. Looking at the counts: 
+
+```{r}
+taxis_clean |> 
+  group_by(passenger_count) |>
+  count() 
+```
+
+129 rides with 0 passengers (very small amount).
+
+Notice that the `RatecodeID` values is either 5 (negotiated) or 99, the `trip_distance` are all zeros, and `trip_durations` are zero or less than a minute. This could indicate that the passenger never rode the taxi or did not reach their destination but still paid the price or even gave a tip. 
+0 passengers is not realistic for a taxi ride. So it makes sense to remove these rows. 
+
+```{r}
+taxis_clean <- taxis_clean |> 
+  filter(passenger_count > 0)
+```
+
+Is `RatecodeID` = 99 meaningful? Let's see how many values there are:
+
+```{r}
+taxis_clean |> 
+  filter(RatecodeID == 99) |>
+  nrow()
+```
+
+Very small, we remove these rows to abide with the data dictionary. 
+
+```{r}
+taxis_clean <- taxis_clean |> 
+  filter(RatecodeID >= 1 & RatecodeID <= 6)
+```
+
+A quick look at the ranges of `trip_duration`:
+```{r}
+taxis_clean |> 
+  arrange(trip_duration) |>
+  select(trip_duration, tip_amount, fare_amount, total_amount, trip_distance, passenger_count, payment_type, RatecodeID) |>
+  head(20)
+```
+
+Two values in the negatives. We know it is impossible to have a negative duration so we will remove these two rows. It also does not make any sense that a taxi ride duration can be 0 minutes or 24 hours. Let's look at that.  
+
+The number of tips given when `trip_duration` is 0:
+
+```{r}
+taxis_clean |> 
+  filter(trip_duration == 0) |>
+  arrange(desc(tip_amount)) |>
+  select(trip_duration, tip_amount, fare_amount, total_amount, trip_distance, passenger_count, payment_type, RatecodeID) |>
+  count(tip_amount > 0) # 44 tips, 2202 no tips
+taxis_clean |> 
+  arrange(desc(trip_duration)) |>
+  select(trip_duration, tip_amount, fare_amount, total_amount, trip_distance, passenger_count, payment_type, RatecodeID) |>
+  head(20)
+```
+
+44 tips given when `trip_duration` = 0. These values are likely to be data entry errors/faults so we will remove these rows as well. 
+
+```{r}
+
+taxis_clean <- taxis_clean |> 
+  filter(trip_duration > 0, trip_duration < 120)
+```
+
+Lastly, we will have a look at the unusually high `total_amount`/`fare_amount values`: 
+
+```{r}
+
+taxis_clean |> 
+  arrange(desc(total_amount)) |>
+  select(tip_amount, fare_amount, total_amount, trip_duration, trip_distance, passenger_count, payment_type, RatecodeID) |>
+  head(20)
+```
+
+A `fare_amount` of \$361770 which totals to \$361772 where the `trip_duration` is 15.5 minutes and 2.2 miles is very unreasonable and not realistic. Looking at other high values of `fare_amount`/`total_amount`, a lot of them seem to be negotiated rides (`RatecodeID` = 5) but the passenger never rode it. 
+
+This may still affect `tip_amount`. We will only remove the top value. 
+
+```{r}
+taxis_clean <- taxis_clean |>
+  filter(fare_amount < 300000)
+```
+
+Re-check the summary:
+
+```{r}
+taxis_clean |> summary()
+```
+
+Looks reasonable.
+
+Note that there are rows where `trip_distance` = 0 but `trip_duration` > 0. We will not remove these values because these are realistic circumstances and may affect tip behaviour in some way (e.g. wasting the taxi driver's time). 
+
+```{r}
+taxis_clean |> filter(trip_distance == 0) |> nrow() # over 11,000 rows 
+```
+
+Over 11,000 events of this. 
+
+Number of rows removed: 
+
+```{r}
+nrow(taxis) - nrow(taxis_clean) 
+```
+In total we have only removed over 7000 rows with the dataset now thoroughly cleaned.
+
+Now exploring our cleaned data.
+
+### Data Exploration Cont'd
+
+Proportion of trip riders who give tips:
+
+```{r}
+tip_proportion <- taxis_clean |> mutate(gave_tip = ifelse(tip_amount > 0, "Yes", "No")) |> group_by(gave_tip) |> count()
+ggplot(tip_proportion, aes(x=gave_tip, y=n, fill=gave_tip)) + 
+  geom_col() +
+  labs(title = "Distribution of 'Gave Tip' (Yes or No)", 
+       x = "Gave Tip", 
+       y = "Count", 
+       fill = "Gave Tip") +
+  geom_text(aes(label=n), position=position_stack(vjust=0.5), color="black") +
+  theme_minimal() +
+  scale_fill_manual(values=c("coral", "cyan"), labels = c("No", "Yes"))
+```
+
+Taxi riders tip nearly twice as often as they don't i.e. the probability a taxi ride gets tipped is `r round(1453318/nrow(taxis_clean), 2)`
+
+Looking at trip counts by day of week. 
+
+```{r}
+taxis_clean |> ggplot(aes(x=dow)) +
+  geom_bar() +
+  labs(title = "Number of Trip Counts by the Day of Week", x = "Day of Week", y = "Count")
+taxis_clean |> group_by(dow) |> count()
+```
+
+The number of trips by day of week is roughly the same except there were significantly less trips on Thursday than other days of the week. Most trips occurred on Saturday with nearly 370,000 trips and Thursday had just over 200,000 trips. Is this consistent throughout the month? Year? Or perhaps Thursday was a public holiday - if so, this may or may not affect the tip amount prediction as people on this day may have a more positive attitude/state and hence are happier to tip or give higher tip amounts. 
+
+Looking at the distribution of `fare_amount`s:
+
+```{r}
+taxis_clean |>
+  ggplot(aes(x=fare_amount)) + geom_histogram(breaks = seq(0:100)-.5) + xlim(0,100) + 
+  labs(title = "Distribution of Fare Amounts", x = "Fare Amount $", y = "Count")
+
+```
+
+Clearly something happening around the \$50 fare. A closer look:
+
+```{r}
+taxis_by_fare <- taxis_clean |> filter(fare_amount > 50 & fare_amount < 60)
+taxis_by_fare |> ggplot(aes(x=fare_amount)) +
+  geom_bar() +
+  labs(title = "Count of Fare Amount (filtered between $50-$60", x = "Fare Amount $", y = "Count")
+taxis_by_fare |> group_by(fare_amount) |> count()
+```
+
+A huge number of taxi rides of 42,268 where the fare amount was \$52.00. Let's find out why. 
+
+```{r}
+taxis_clean |> filter(fare_amount == 52)
+```
+
+A few variables to note: 
+
+- Consistent `RadecodeID` of 2 (JFK)
+
+- `PULocationID` mostly the value of 132, but `DOLocationID` values appear more varied => A major event? 
+
+- **Consistent pick-up and drop-off times that all occur in the morning on Monday => a surge of trip counts on Monday. **
+
+- `trip_duration` is usually about 30 minutes
+
+- Most importantly, tips are frequent here and the value of the tips appear very high compared to the mean `tip_amount`.
+
+```{r}
+taxis_clean |> filter(fare_amount == 52) |> pull(tip_amount) |> mean()
+```
+
+The mean `tip_amount` when the `fare_amount` is \$52.00 is \$7.56, which is much higher than the overall mean of \$1.79. 
+
+Researching what happened on 6 February 2017 in New York, there was a 'Annual Travel Show' that had over 30,000 participants (highest attendance in the Show's history). This was an international event consisting of exhibitors of 560 companies representing over 170 countries. From a [New York Times](https://investors.nytco.com/news-and-events/press-releases/news-details/2017/2017-New-York-Times-Travel-Show-Reports-Attendance-Highest-Ever/default.aspx) report. 
+
+However, given this is a relatively small proportion of taxi riders compared to the overall population (as shown by the distribution of `fare_amount`), this should not significantly influence tip predictions. So there is no need to remove these values.  
+
+Is there a relationship between `trip_duration` and `tip_amount`? 
+
+```{r}
+taxis_clean |>
+  sample_n(5e4) |> 
+  ggplot(aes(x = trip_duration, y = tip_amount)) + 
+  geom_point(alpha = 0.5, color = "blue") + 
+  geom_smooth(method = "lm", color = "red", se = FALSE) +  # Adds a linear regression line
+  theme_minimal() + 
+  labs(title = "Scatter Plot of Trip Duration vs. Tip Amount with Linear Trend", 
+       x = "Trip Duration (minutes)", 
+       y = "Tip Amount ($)")
+
+```
+Generally, as `trip_duration` increases, `tip_amount` increases. It is interesting to see that that there are tip amounts even when the trip duration is 0 minutes. 
+
+Is there a certain pattern to `tip_amount` across the week? 
+
+```{r}
+taxis_clean |> sample_n(5e4) |> # just use a sample 
+  ggplot(aes(x = dow, y = tip_amount)) + geom_jitter() + 
+  labs(title = "Tip Amounts by Day of Week", x = "Day of Week", y = "Tip amount ($)")
+```
+
+Too many points to discern a pattern, so let's look at the median:
+
+```{r}
+taxis_clean |>
+  group_by(dow) |>
+  summarize(med = median(tip_amount)) |>
+  ggplot(aes(x=dow,y=med)) +  geom_point() + 
+  geom_line(aes(group=1),linetype='dotted')  + 
+  labs(title = "Median Tip Amounts by Day of Week", x = "Day of Week", y = "Median tip amount ($)")
+
+```
+
+It is interesting to see that the median tip amount is greater on weekdays than on weekends. 
+
+
+Try the same by time of day
+
+```{r}
+taxis_clean |>
+  group_by(hour_trip_start) |>
+  summarize(med_tip = median(tip_amount)) |>
+  ggplot(aes(x=hour_trip_start,y=med_tip)) +  geom_point() + 
+  geom_line(aes(group=1),linetype='dotted') + 
+  labs(title = "Median Tip Amounts by time of day", x = "Time of day (hour)", y = "Median tip amount ($)")
+
+```
+
+So tips are usually given throughout the whole day and are given lower tips between 3am and 7am. 
+
+Is the pattern the same across the days of week? 
+
+```{r}
+
+taxis_clean |>
+  group_by(dow,hour_trip_start) |>
+  summarize(med_tip = median(tip_amount)) |>
+  ggplot(aes(x=hour_trip_start,y=med_tip)) +  geom_point() + 
+  facet_wrap(~dow) +geom_line(aes(group=1),linetype='dotted') +
+  labs(title = "Median tip amounts by time of day of each Day of Week", x = "Time of day (hour)", y = "Median tip amount ($)")
+```
+
+All days seem to follow the overall pattern except the median `tip_amount` on Friday and Saturday is more consistent throughout the day. 
+
+
+### Visualizing the Spatial Data
+
+```{r}
+# Take a small subset to plot quicker
+sm_taxi <- taxis_clean |> sample_n(1e4) # 10,000 points
+
+# Add Lat and Long for pickup locations
+# just use centre points of locations
+latmap <- read_csv("taxilatlong.csv")
+glimpse(latmap)
+
+sm_taxi <- sm_taxi |>
+  left_join(latmap, by = c("PULocationID" = "LocationID")) |>
+  rename(pickup_latitude = lat,  pickup_longitude = long)
+
+# Plot on a map
+leaflet(sm_taxi) |>
+  addTiles() |> 
+  addCircleMarkers(~pickup_longitude,~pickup_latitude, radius=2,stroke = FALSE, opacity=1, fillOpacity =1)
+```
+
+These are just centre points all on top of each other. Let's justter it a bit. 
+
+```{r}
+sm_taxi <- sm_taxi |> 
+  mutate(pickup_latitude = jitter(pickup_latitude, amount = .003),
+         pickup_longitude = jitter(pickup_longitude, amount = .003))
+
+# Try plotting again with juttered points
+leaflet(sm_taxi) |>  
+  addTiles() |> 
+  addCircleMarkers(~pickup_longitude,~pickup_latitude, radius=2,stroke = FALSE, opacity=1, fillOpacity =1)
+```
+
+We can see more here. 
+
+- The majority of pick-ups are in the City Centre
+
+- A large number of pick-ups from the airport => likely explains the long duration times
+
+
+
+### Feature Engineering
+
+Let's create an additional feature that might improve the predictive model:
+
+- A tip percentage that calculates the tip as a percentage of the total fare (assuming that the `fare_amount` > $0)
+
+```{r}
+taxis_clean <- taxis_clean |> 
+  mutate(
+    tip_percentage = ifelse(fare_amount > 0, (tip_amount / fare_amount) * 100, NA)
+  )
+```
+
+
+Check the summary to ensure the new columns were added correctly:
+
+```{r}
+taxis_clean |> summary()
+```
+
+Tip percentage 200,000%? Let's see the top values according to this variable:
+
+```{r}
+taxis_clean |>
+  arrange(desc(tip_percentage)) |>
+  select(tip_percentage, trip_duration, tip_amount, fare_amount, total_amount, trip_distance, passenger_count, payment_type, RatecodeID) |>
+  head(20)
+```
+
+They consist of very small fares but tip amounts at whole numbers which cause a massive tip percentage. Low fares could be because of discounts or some sort of perk given to the passenger, which makes sense and passengers may be willing to give such a tip in such circumstance. 
+These high values may skew the model. Let's cap the tip percentage at a reasonable maximum: 
+
+```{r}
+taxis_clean <- taxis_clean |> 
+  mutate(tip_percentage = ifelse(tip_percentage >= 100, 100, tip_percentage))
+ 
+ggplot(taxis_clean, aes(x = tip_percentage)) + 
+  geom_histogram(binwidth = 4, fill = "cyan", color = "black") + 
+  theme_minimal() + 
+  labs(title = "Distribution of Tip Percentage", x = "Tip Percentage", y = "Frequency")
+
+
+```
+
+Capping at 100% puts a good balance between capturing realistic tipping behaviour and minimizing the impact of extreme outliers.
+
+So if a taxi ride is tipped, then its tip percentage is about 20% the fare amount. 
+
+
+Another additional feature could be about the `tip_amount` throughout each period of the day since there is an hour of the day effect. 
+
+Define time periods: Morning (5am to 11.59am), Afternoon (12pm to 4.59pm), Evening (5pm to 9.59pm), Night (10pm to 4.59am)
+
+```{r}
+
+taxis_clean <- taxis_clean |> 
+  mutate(time_of_day = case_when(
+    hour(pickup_datetime) >= 5 & hour(pickup_datetime) < 12 ~ "Morning",
+    hour(pickup_datetime) >= 12 & hour(pickup_datetime) < 17 ~ "Afternoon",
+    hour(pickup_datetime) >= 17 & hour(pickup_datetime) < 22 ~ "Evening",
+    TRUE ~ "Night"
+  ))
+
+# Convert to a factor for better handling in plots and models
+taxis_clean$time_of_day <- factor(taxis_clean$time_of_day, levels = c("Morning", "Afternoon", "Evening", "Night"))
+
+```
+
+
+Visualize how tipping percentage varies across different times of day
+
+```{r}
+ggplot(taxis_clean, aes(x = time_of_day, y = tip_percentage)) + 
+  geom_boxplot(fill = "cyan", color = "black") + 
+  theme_minimal() + 
+  labs(title = "Tip Percentage by Time of Day", x = "Time of Day", y = "Tip Percentage")
+```
+
+Not a great visualization, but seems generally the same (20%) throughout the times of day
+
+Let's see by day of week:
+
+```{r}
+# Summarize the median tip percentage by time_of_day and dow
+taxis_clean_summary <- taxis_clean |> 
+  group_by(time_of_day, dow) |> 
+  summarize(median_tip_percentage = median(tip_percentage, na.rm = TRUE)) |>
+  ungroup()
+
+# Visualize the median tip percentage by day of the week within each time of day category
+ggplot(taxis_clean_summary, aes(x = dow, y = median_tip_percentage, group = 1)) + 
+  geom_point(color = "blue") + 
+  geom_line(linetype = "dotted", color = "blue") + 
+  facet_wrap(~ time_of_day, ncol = 2) + 
+  theme_minimal() + 
+  labs(title = "Median Tip Percentage by Day of Week within Each Time of Day", 
+       x = "Day of Week", 
+       y = "Median Tip Percentage (%)")
+```
+
+Tip percentages seem to be highest in the evenings of Mondays to Thursdays and lowest throughout most of Saturday except at night. Note this may be different to other weeks within the month or year, so we will not look into this too deep. 
+
+Finally, preparing the data for model fitting: focus on `tip_amount` so remove `tip_percentage` and also the following variables because we know it does not help predict tip for the model:
+
+- `total_amount`
+
+- `DOLoactionID` & `PULocationID`
+
+- `pickup_datetime` & `dropoff_datetime` (have `trip_duration` instead which is better because it can be measured and compared which these variables cannot)
+
+- `payment_type` (we have a categorized version of this)
+
+And also convert `RatecodeID` to a categorical variable because the numbers represent different levels and is not a measurement.
+
+```{r}
+taxis_clean <- taxis_clean |> 
+  select(-total_amount, -DOLocationID, -PULocationID, -pickup_datetime, -dropoff_datetime, -payment_type)
+
+taxis_clean <- taxis_clean |>
+  mutate(RatecodeID = factor(RatecodeID))
+
+taxis_clean2 <- taxis_clean[,-which(names(taxis_clean) == "tip_percentage")]
+```
+
+Now, we have a solid set-up for building predictive models for `tip_amount`. 
+
+
+
+# 2. Model Fitting and Cross-validation
+
+### Model Fitting
+
+First, we set-up the matrices and fit the model using backward-selection.
+
+```{r}
+
+# Generate the design matrix and response
+mf <- model.frame(tip_amount ~ ., data = taxis_clean2)
+X <- model.matrix(tip_amount ~ ., mf)[,-1] # Remove the intercept
+
+# Perform best subset selection using backward method
+subsets1.reg <- regsubsets(X, taxis_clean2$tip_amount, nvmax = 20, method = "backward")
+subsets1.summary <- summary(subsets1.reg)
+
+# Calculate apparent errors
+apparentErrors <- subsets1.summary$rss / (nrow(taxis_clean2) - 1:20)
+
+# Plot the apparent errors
+qplot(y = apparentErrors, x = 1:20) + 
+  labs(title = "Apparent Errors for Model Selection", 
+       x = "Number of Predictors", 
+       y = "Apparent Errors") +
+  theme_minimal()
+
+```
+
+
+### Cross-validation
+
+```{r}
+
+y <- taxis_clean2$tip_amount
+
+# allyhat function for cross-validation
+allyhat <- function(xtrain, ytrain, xtest, lambdas, nvmax = 50) {
+  n <- nrow(xtrain)
+  yhat <- matrix(nrow = nrow(xtest), ncol = length(lambdas))
+  search <- regsubsets(xtrain, ytrain, nvmax = nvmax, method = "backward")
+  summ <- summary(search)
+  
+  for(i in 1:length(lambdas)) {
+    penMSE <- n * log(summ$rss) + lambdas[i] * (1:nvmax)
+    best <- which.min(penMSE)
+    betahat <- coef(search, best)
+    xinmodel <- cbind(1, xtest)[,summ$which[best,]]
+    yhat[,i] <- xinmodel %*% betahat
+  }
+  
+  yhat
+}
+
+# Cross-validation setup
+n <- nrow(X)
+folds <- sample(rep(1:10, length.out = n))
+lambdas <- c(0.1, 0.5, 1, 2, 5, 10, 20)
+fitted <- matrix(nrow = n, ncol = length(lambdas))
+
+# Run cross-validation
+for(k in 1:10) {
+  train <- (1:n)[folds != k]
+  test <- (1:n)[folds == k]
+  fitted[test, ] <- allyhat(X[train, ], y[train], X[test, ], lambdas, nvmax = 20)
+}
+
+# Calculate Mean Squared Error for each lambda
+mse <- colMeans((y - fitted)^2)
+mse # consistent
+
+# Find the best lambda
+best_lambda <- lambdas[which.min(mse)]
+best_lambda #0.1
+
+```
+
+As lambda = 0.1 is selected, this means that a slight penalty is applied to the model complexity. This small value suggests that the model still includes a reasonable number of predictors but avoids overfitting. 
+
+The consistent MSE values across the different lambdas mean that the model is stable and performs similarly across various regularization strengths. 
+
+But note that the mean of `tip_amount` is \$`r taxis_clean2$tip_amount |> mean() |> round(2)`. So while the model is able to predict tip amounts with some accuracy, there may still be factors influencing tips that the model does not fully capture. This is not unusual in tip prediction since human tipping behaviour can be influenced by many factors, some which may not be present in the data. 
+
+Hence, given the variability in tipping behaviour (especially the right-skew in the distribution of `tip_amounts`), some degree of error is to be expected. 
+
+A look at the predictors from the model chosen: 
+
+```{r}
+# Fit the model again using the best_lambda
+final_search <- regsubsets(X, y, nvmax = 20, method = "backward")
+final_summary <- summary(final_search)
+
+# Find best model for the selected lambda
+n <- nrow(X)
+penMSE <- n * log(final_summary$rss) + best_lambda * (1:20)
+best_model_index <- which.min(penMSE)
+
+# Extract coefficients
+best_model_coefs <- coef(final_search, best_model_index)
+best_model_coefs
+
+```
+Some key predictors and notes: 
+
+`trip_distance`, `RatecodeID`, and `fare_amount` are predictors that increase the tip amount. 
+
+- For every increase in a mile, the tip amount is predicted to increase by approximately \$0.19, holding other factors constant.
+
+- Trips with final rate code 'Newark' (`RatecodeID` = 3) have a significantly greater predicted tip amount than if it was 'Standard rate' (`RatecodeID` = 1).
+
+- For every additional dollar in `fare_amount`, the tip amount is predicted to increase by approximately $0.01.
+
+- `payment_type_labelCash` (-2.41355584): this negative value is expected since cash tips are not included in the data. 
+
+- Certain times of the day negatively influence tips. For example, if a taxi ride is at 3am, then the predicted tip amount decreases. 
+
+### Model Testing
+
+Now applying the model to week 4 taxi data: 
+
+We will filter out outliers in the week 4 data because we are not interested in predictions on obvious outliers. 
+
+```{r}
+# Load Week 4 data
+week4 <- read_csv("week4.csv")
+
+# Apply the same cleaning steps
+
+week4_clean <- week4 |>
+  mutate(dropoff_datetime = tpep_dropoff_datetime,
+         pickup_datetime = tpep_pickup_datetime,
+         dow = wday(pickup_datetime, label = TRUE, abbr = TRUE, week_start = 1),
+         hour_trip_start = factor(hour(pickup_datetime)),
+         trip_duration = as.numeric(difftime(dropoff_datetime, pickup_datetime, units = "mins")),
+         payment_type_label = fct_recode(factor(payment_type), 
+                                         "Credit Card" = "1",
+                                         "Cash" = "2",
+                                         "No Charge" = "3",
+                                         "Other" = "4")) |>
+  filter(tip_amount >= 0 & fare_amount >= 0 & tip_amount <= 25) |>
+  filter(passenger_count > 0) |>
+  filter(RatecodeID >= 1 & RatecodeID <= 6) |>
+  filter(trip_duration > 0, trip_duration < 120) |>
+  mutate(RatecodeID = factor(RatecodeID),
+         time_of_day = case_when(
+           hour(pickup_datetime) >= 5 & hour(pickup_datetime) < 12 ~ "Morning",
+           hour(pickup_datetime) >= 12 & hour(pickup_datetime) < 17 ~ "Afternoon",
+           hour(pickup_datetime) >= 17 & hour(pickup_datetime) < 22 ~ "Evening",
+           TRUE ~ "Night"
+         )) |> 
+  select(-congestion_surcharge, -airport_fee, -tpep_dropoff_datetime, -tpep_pickup_datetime, -total_amount, -DOLocationID, -PULocationID, -pickup_datetime, -dropoff_datetime, -payment_type) 
+
+# Convert to a factor for better handling in plots and models
+week4_clean$time_of_day <- factor(week4_clean$time_of_day, levels = c("Morning", "Afternoon", "Evening", "Night"))
+
+# Check if the col names of the training data and testing data match
+all(colnames(taxis_clean2) == colnames(week4_clean)) # expect TRUE
+
+```
+
+### MSPE 
+
+Finding the MPSE for week 4: 
+
+```{r}
+# Generate matrix for Week 4 data
+mf_week4 <- model.frame(tip_amount ~ ., data = week4_clean)
+X_week4 <- model.matrix(tip_amount ~ ., mf_week4)[, -1]  # Remove intercept
+
+# Response variable for Week 4
+y_week4 <- week4_clean$tip_amount
+
+# Final model using the best lambda
+final_fitted <- allyhat(X, y, X_week4, lambdas = best_lambda, nvmax = 20)
+
+# Calculate MSPE on the Week 4 data
+mspe <- mean((y_week4 - final_fitted)^2)
+mspe
+
+```
+
+The MSPE is a measure of the average squared difference between the observed actual values (`tip_amount`) and the values predicted by the model. It helps assess how well the model predicts unseen data.
+
+So MSPE = `r mspe |> round(2)` indicates the average squared error for each prediction of `tip_amount` in the week 4 data. 
+
+Since MSPE is the squared difference between the actual and predicted `tip_amount`, the units of MSPE is squared dollars (so square root this to relate it to actual values). 
+
+# 3. Interpretation 
+
+An MSPE of \$7.26 suggests that, on average, the squared error of the model's tip predictions is 7.26. Taking the square root gives a Root Mean Squared Prediction Error (RMSPE) of approximately $2.69, meaning that on average, the model's predictions deviate from actual tip amounts by about \$2.69. 
+
+Given that the average `tip_amount` is \$1.79, this indicates that the model's predictions have notable variability and room for improvement. 
+
+The model successfully captures some patterns that influencing tipping behaviour, such as `trip_distance`, `Rate_code_ID`, and `fare_amount`. However, tipping is complex and can be influenced by other unmeasured factors which led to this prediction error. 
+
+### Face Validity of the Model ###
+
+- **Reasonable Predictors:** Predictors like `trip_distance`, `fare_amount`, the different levels of `RatecodeID`, and time-related variables are reasonable and logically connects to how much a tip might be. 
+
+- **Human Factors Not Captured:** As mentioned, tipping behaviour is complex and is influenced by subjective and external factors such as passenger mood, service quality, interaction/relationship with the driver - variables not present in the data. These ubobserved influences introduce variability, limiting the model's predictive power. 
+
+- **Coefficient Interpretability:** The signs of the estimated coefficients make intuitive sense. For example, positive coefficients for `trip_distance` and `fare_amount` suggest that longer and more expensive trips tend to receive higher tips, which makes sense.  
+
+### Obvious Model Flaws & Areas for Improvement ###
+
+- **Missing Influential Variables:** The model does not account for external factors such as traffic conditions, weather, driver personality, or major events, which can significantly impact tipping behaviour. Future improvements could involve integrating additional data sources to better capture this variability. Perhaps there exists interaction terms that could possibly improve the model.  
+
+- **Potential Generalization Issues:** The relatively high MSPE on Week 4 taxi data suggests that while the model performs reasonably, its accuracy may vary when applied to different time periods or locations where tipping behaviour may differ. If major events or seasonal factors influence tipping, this should be considered when generalizing the model. 
+
+# Conclusion
+
+Overall, the model performs reasonably well at predicting taxi tips, but the MSPE of 7.26 indicates that predictions deviate on average by about \$2.69. This level of error was expected due to the complexity and variability of human tipping behaviour, which is influenced by subjective factors not captured in the data. 
+
+The model was built using logically relevant predictors, with key factors including `trip_distance`, different levels of `RatecodeID`, `fare_amount`, and time of day. However, since tipping is influenced by additional unobserved factors - such as mood, service quality, or passenger-driver interactions -  the nodel cannot fully explain tip amounts, resulting in some level of prediction error. 
+
+### EOF
