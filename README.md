@@ -9,7 +9,9 @@ Using machine-learning to predict whether NYC taxi riders will leave a tip based
 
 In the USA, many service workers rely heavily on tips for their income. Tips are voluntary payments given by customers in addition to the listed price. For yellow taxis in New York, tourist advice suggests tipping 15-20%.
 
-This project utilizes a rich [dataset](https://www.nyc.gov/site/tlc/about/tlc-trip-record-data.page) from New York taxis to build a predictive model for tip amounts. The dataset includes two weeks of taxi trips in New York City, containing information on the time of day, day of the week, trip distance, fare price, number of passengers, and pickup/dropoff locations.
+This project utilizes a rich dataset from [New York Taxis](https://www.nyc.gov/site/tlc/about/tlc-trip-record-data.page) to build a predictive model for tip amounts. The dataset includes two weeks of taxi trips in New York City, containing information on the time of day, day of the week, trip distance, fare price, number of passengers, and pickup/dropoff locations.
+
+*Note that the two sets of data were too large to be added in the repo. Access them from the website [here](https://www.nyc.gov/site/tlc/about/tlc-trip-record-data.page). 
 
 ### Main Task
 
