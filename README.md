@@ -1,6 +1,8 @@
 # NYC-Taxis-Tip-Prediction
 Using machine-learning to predict whether NYC taxi riders will leave a tip based on trip data. Analyzes key factors influencing tipping behavior using data-driven insights.
 
+[See Markdown](https://jchu630.github.io/NYC-Taxis-Tip-Prediction/)
+
 ## Project Rundown
 
 ### Overview
